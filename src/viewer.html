@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MdViewer</title>
+<link rel="stylesheet" href="/__app/viewer.css">
+<link rel="stylesheet" href="/__app/highlight.css">
+<script src="/__app/markdown-it.min.js"></script>
+<script src="/__app/highlight.min.js"></script>
+</head>
+<body>
+<div id="bar">
+  <button id="editBtn" title="편집 / 보기 전환 (Ctrl+E)">편집</button>
+  <button id="copyBtn" title="노션에 붙여넣을 수 있게 전체 복사 (Ctrl+Shift+C)">복사</button>
+  <button id="saveBtn" title="저장 (Ctrl+S)">저장</button>
+  <span id="state"></span>
+</div>
+<nav id="side">
+  <div class="toc" id="toc"></div>
+</nav>
+<section id="editpane">
+  <textarea id="editor" spellcheck="false" wrap="soft"></textarea>
+</section>
+<main id="view"><article id="doc"></article></main>
+<div id="toast"></div>
+<script>
+const md = window.markdownit({
+  html: true,
+  linkify: true,
+  highlight(code, lang) {
+    if (lang && hljs.getLanguage(lang)) {
+      try { return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value; } catch (e) {}
+    }
+    return '';
+  }
+});
+
+const $ = id => document.getElementById(id);
+const editor = $('editor'), view = $('view'), doc = $('doc');
+const post = msg => window.chrome && window.chrome.webview && window.chrome.webview.postMessage(msg);
+
+let saved = '';      // 디스크에 있는 내용 (줄바꿈은 \n 으로 통일)
+let crlf = false;    // 원본 줄바꿈이 CRLF 였는지
+let editing = false;
+let dirty = false;
+
+// GitHub 방식의 제목 앵커 (한글 유지)
+function slug(text, used) {
+  let s = text.trim().toLowerCase()
+    .replace(/[^\p{L}\p{N}\s_-]/gu, '')
+    .replace(/\s/g, '-');
+  let out = s, n = 1;
+  while (used.has(out)) out = s + '-' + n++;
+  used.add(out);
+  return out;
+}
+
+function taskLists(root) {
+  root.querySelectorAll('li').forEach(li => {
+    const first = li.firstChild;
+    const node = first && first.nodeName === 'P' ? first.firstChild : first;
+    if (!node || node.nodeType !== 3) return;
+    const m = node.textContent.match(/^\[([ xX])\]\s/);
+    if (!m) return;
+    node.textContent = node.textContent.slice(m[0].length);
+    const box = document.createElement('input');
+    box.type = 'checkbox'; box.disabled = true; box.checked = m[1] !== ' ';
+    node.parentNode.insertBefore(box, node);
+    li.classList.add('task');
+  });
+}
+
+function buildToc(root) {
+  const used = new Set();
+  const heads = [...root.querySelectorAll('h1, h2, h3, h4')];
+  heads.forEach(h => { h.id = slug(h.textContent, used); });
+  const toc = $('toc');
+  toc.innerHTML = '';
+  document.body.classList.toggle('notoc', heads.length < 2);
+  if (heads.length < 2) return [];
+  const min = Math.min(...heads.map(h => +h.tagName[1]));
+  heads.forEach(h => {
+    const a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    a.style.paddingLeft = (6 + (+h.tagName[1] - min) * 14) + 'px';
+    a.onclick = e => { e.preventDefault(); h.scrollIntoView(); history.replaceState(null, '', a.href); };
+    toc.appendChild(a);
+  });
+  return heads;
+}
+
+let heads = [];
+function markActive() {
+  let cur = heads[0];
+  for (const h of heads) if (h.getBoundingClientRect().top < 90) cur = h;
+  document.querySelectorAll('#toc a').forEach(a => a.classList.toggle('active', !!cur && a.hash === '#' + cur.id));
+}
+document.addEventListener('scroll', markActive, { passive: true });
+
+function renderText(text) {
+  doc.innerHTML = md.render(text);
+  doc.querySelectorAll('pre code').forEach(c => c.classList.add('hljs'));
+  taskLists(doc);
+  heads = buildToc(doc);
+  markActive();
+}
+
+async function load(keep) {
+  const y = editing ? view.scrollTop : window.scrollY;
+  const res = await fetch(location.pathname + '?raw=' + Date.now());
+  if (!res.ok) { doc.innerHTML = '<p class="error">파일을 읽을 수 없습니다.</p>'; return false; }
+  const text = (await res.text()).replace(/^﻿/, '');
+  crlf = text.includes('\r\n');
+  saved = text.replace(/\r\n/g, '\n');
+  if (!dirty) { editor.value = saved; renderText(saved); }
+  if (keep) { if (editing) view.scrollTop = y; else window.scrollTo(0, y); }
+  else if (location.hash) {
+    const t = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+    if (t) t.scrollIntoView();
+  }
+  return true;
+}
+
+function setDirty(v) {
+  if (dirty === v) return;
+  dirty = v;
+  document.body.classList.toggle('dirty', v);
+  $('state').textContent = v ? '수정됨' : '';
+  post(v ? 'dirty' : 'clean');
+}
+
+function setEditing(v) {
+  editing = v;
+  document.body.classList.toggle('editing', v);
+  $('editBtn').textContent = v ? '보기' : '편집';
+  if (v) {
+    const ratio = window.scrollY / Math.max(1, document.documentElement.scrollHeight - innerHeight);
+    requestAnimationFrame(() => {
+      editor.scrollTop = ratio * (editor.scrollHeight - editor.clientHeight);
+      view.scrollTop = ratio * (view.scrollHeight - view.clientHeight);
+      editor.focus();
+    });
+  } else {
+    renderText(editor.value);
+  }
+}
+
+function save() {
+  if (!dirty) { toast('변경 사항 없음'); return; }
+  const text = crlf ? editor.value.replace(/\n/g, '\r\n') : editor.value;
+  post('save\n' + text);
+}
+
+// C#에서 호출
+window.onSaved = () => { saved = editor.value; setDirty(false); toast('저장했습니다'); };
+window.onSaveFailed = msg => toast('저장 실패: ' + msg, 3000);
+window.saveAndClose = () => { save(); };
+window.reloadDoc = async () => {
+  if (dirty) { toast('다른 곳에서 파일이 바뀌었습니다 (편집 내용 유지)', 3000); return; }
+  if (await load(true)) toast('다시 불러옴');
+};
+
+// 편집기
+let timer;
+editor.addEventListener('input', () => {
+  setDirty(editor.value !== saved);
+  clearTimeout(timer);
+  timer = setTimeout(() => renderText(editor.value), 120);
+});
+editor.addEventListener('keydown', e => {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    document.execCommand('insertText', false, '  ');
+  }
+});
+// 편집기 스크롤에 맞춰 미리보기도 비율대로 이동
+editor.addEventListener('scroll', () => {
+  const r = editor.scrollTop / Math.max(1, editor.scrollHeight - editor.clientHeight);
+  view.scrollTop = r * (view.scrollHeight - view.clientHeight);
+}, { passive: true });
+
+window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+
+function toast(msg, ms) {
+  const t = $('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), ms || 1300);
+}
+
+// 노션용 복사: 마크다운 원문을 복사하면 노션이 블록으로 변환한다.
+// 노션 제목은 H3까지라 #### 이하는 굵은 글씨로 바꾼다 (코드 블록 안은 그대로).
+function toNotion(text) {
+  let fence = null;
+  return text.split('\n').map(line => {
+    const f = line.match(/^\s*(`{3,}|~{3,})/);
+    if (f) {
+      if (!fence) fence = f[1][0];
+      else if (f[1][0] === fence) fence = null;
+      return line;
+    }
+    if (fence) return line;
+    const h = line.match(/^#{4,6}\s+(.*?)\s*#*\s*$/);
+    return h ? '**' + h[1] + '**' : line;
+  }).join('\n');
+}
+
+function copyForNotion() {
+  post('copy\n' + toNotion(editor.value));
+}
+window.onCopied = () => toast('복사했습니다 — 노션에 붙여넣으세요');
+
+$('copyBtn').onclick = copyForNotion;
+$('editBtn').onclick = () => setEditing(!editing);
+$('saveBtn').onclick = save;
+
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (e.ctrlKey && k === 's') { e.preventDefault(); save(); }
+  else if (e.ctrlKey && e.shiftKey && k === 'c') { e.preventDefault(); copyForNotion(); }
+  else if (e.ctrlKey && k === 'e') { e.preventDefault(); setEditing(!editing); }
+  else if (e.ctrlKey && k === 'o') { e.preventDefault(); post('open'); }
+  else if (e.ctrlKey && k === 'w') { e.preventDefault(); post('close'); }
+  else if (e.ctrlKey && k === 'p') { e.preventDefault(); window.print(); }
+  else if (e.ctrlKey && k === 'b') { e.preventDefault(); document.body.classList.toggle('hidetoc'); }
+  else if (e.key === 'F5') { e.preventDefault(); window.reloadDoc(); }
+});
+
+document.title = decodeURIComponent(location.pathname.split('/').pop());
+load(false);
+</script>
+</body>
+</html>

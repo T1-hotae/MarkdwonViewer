@@ -1,0 +1,5 @@
+# 빌드 결과물 (src/build.ps1 로 다시 만들 수 있음)
+/MdViewer.exe
+/*.dll
+/dist/
+/src/obj/
